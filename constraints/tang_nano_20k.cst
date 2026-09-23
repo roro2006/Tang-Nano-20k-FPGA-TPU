@@ -1,0 +1,6 @@
+# Fill these package pins from the Tang Nano 20K board revision schematic.
+# Do not guess USB-UART pins: BL616 routing differs between board revisions.
+# IO_TYPE=LVTTL33;
+# LOCATE COMP "clk27" SITE "PIN_...";
+# LOCATE COMP "uart_rx_pin" SITE "PIN_...";
+# LOCATE COMP "uart_tx_pin" SITE "PIN_...";
