@@ -25,11 +25,12 @@ O = sat16((P V) >> 16) Wo
   A edge, a 512×64-bit K^T/V memory feeding the B edge, and a 2 KiB UART buffer.
 * **Softmax unit**: per-row max, `EXP_LUT` ROM, 33-cycle restoring divider and
   the remainder fix-up that makes each row sum to exactly 65536.
-* **UART protocol** at 115200 baud over the on-board BL616 USB bridge, framed
+* **UART protocol** at 1 Mbaud (27 clocks per bit) over the on-board BL616 USB bridge, framed
   `A5 5A len16 payload xor`. Commands: ECHO, LOAD weights, ATTN, INFO.
 
 At 27 MHz an attention layer computes in well under a millisecond; the
-~2 KiB transfer each way (about 0.36 s round trip at 115200 baud) dominates.
+~2 KiB transfer each way dominates: about 51 ms per round trip at 1 Mbaud
+(loading both layers' weights takes 0.7 s).
 
 | LED (active low) | Meaning |
 |---|---|

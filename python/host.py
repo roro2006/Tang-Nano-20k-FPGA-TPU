@@ -18,6 +18,8 @@ from q8_attention import attention_q8_8, pack_frame, unpack_frame
 OP_ECHO, OP_LOAD, OP_ATTN, OP_INFO, OP_ERROR = 0x01, 0x02, 0x03, 0x04, 0xEE
 MATRIX_NAMES = ("q", "k", "v", "o")
 TOKENS, WIDTH = 16, 64
+# Must match BAUD in rtl/tang_nano_20k_top.sv.
+DEFAULT_BAUD = 1_000_000
 
 
 def read_matrix(path: Path, rows: int, cols: int) -> list[list[int]]:
@@ -62,7 +64,7 @@ def response(op: int, status: int = 0, data: bytes = b"") -> bytes:
 class TpuLink:
     """Synchronous request/response client for the FPGA."""
 
-    def __init__(self, port: str, baud: int = 115200, timeout: float = 5.0):
+    def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = 5.0):
         try:
             import serial
         except ImportError as exc:
@@ -170,7 +172,7 @@ def main() -> None:
     parser.add_argument("port", help="UART port, e.g. COM4 or /dev/ttyUSB1")
     parser.add_argument("command", choices=("info", "selftest", "raw"))
     parser.add_argument("payload", type=Path, nargs="?", help="raw payload file for 'raw'")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--runs", type=int, default=4)

@@ -11,7 +11,8 @@ module tang_nano_20k_top (
     output logic [5:0] led
 );
     localparam integer CLK_HZ = 27_000_000;
-    localparam integer BAUD = 115_200;
+    // 27 MHz / 1 Mbaud is exactly 27 clocks per bit.
+    localparam integer BAUD = 1_000_000;
     localparam integer STRETCH = 22;
 
     // Power-on reset held for 2^16 cycles, plus a synchronised button.
