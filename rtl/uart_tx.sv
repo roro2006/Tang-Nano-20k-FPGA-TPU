@@ -9,7 +9,7 @@ module uart_tx #(
     logic [9:0] shift;
     always_ff @(posedge clk) begin
         if (rst) begin tx <= 1'b1; busy <= 1'b0; ticks <= 0; bit_index <= 0; shift <= '1; end
-        else if (start && !busy) begin shift <= {1'b1, data, 1'b0}; busy <= 1'b1; tx <= 1'b0; ticks <= 1; bit_index <= 0; end
+        else if (start && !busy) begin shift <= {1'b1, data, 1'b0}; busy <= 1'b1; tx <= 1'b0; ticks <= 0; bit_index <= 0; end
         else if (busy) begin
             if (ticks == CLKS_PER_BIT-1) begin
                 ticks <= 0; bit_index <= bit_index + 1'b1; shift <= {1'b1, shift[9:1]};

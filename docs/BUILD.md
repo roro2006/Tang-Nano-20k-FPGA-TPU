@@ -1,56 +1,94 @@
 # Build and validation
 
+## Tools
+
+The open flow uses [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build)
+(yosys, nextpnr-himbaechel with the Gowin backend, apicula's `gowin_pack`,
+openFPGALoader, Icarus Verilog). On Windows, extract it and either add `bin`
+and `lib` to `PATH` or pass `TOOLS=<install dir>` to make. The Makefile needs
+GNU make and a POSIX shell. Git Bash ships without `make`; install it (for
+example `winget install ezwinports.make`) or use MSYS2/WSL, or run the
+yosys / nextpnr-himbaechel / gowin_pack lines from the `build/tpu.fs`
+recipe by hand.
+
 ## Python oracle
 
-From the project root:
-
 ```sh
-PYTHONPATH=python python3 -m unittest discover -s python -p 'test_*.py'
+make test
+make generate    # regenerates rtl/exp_rom.sv from EXP_LUT
 ```
 
-Generate the LUT and a 16×64 identity-weight vector:
-
-```sh
-make generate
-```
-
-Create the deterministic starter dataset:
-
-```sh
-make dataset
-```
+`test_exp_rom_matches_generator` fails if `rtl/exp_rom.sv` drifts from the
+oracle's table.
 
 ## RTL simulation
 
-With Icarus Verilog:
-
 ```sh
-iverilog -g2012 -o sim/tb sim/tb_systolic_8x4.sv rtl/systolic_8x4.sv
-vvp sim/tb
+make sim
 ```
 
-Run the UART smoke test with a small simulated divisor:
+* `sim-systolic` — random 8×K·K×4 tiles, both product modes, every PE.
+* `sim-uart` — byte echo through `uart_echo_top`.
+* `sim-top` — the end-to-end check. `python/sim_vectors.py` builds a byte
+  script (INFO, ECHO, a corrupted frame, four weight loads, two attention
+  layers including a saturating one, a bad-length request) and
+  `tb_tpu_top.sv` drives it through the real UART at 8 clocks per bit,
+  comparing every response byte with `attention_q8_8`. About one minute in
+  Icarus.
+
+## Bitstream
 
 ```sh
-iverilog -g2012 -o sim/tb_uart sim/tb_uart_echo.sv rtl/uart_echo_top.sv \
-  rtl/uart_rx.sv rtl/uart_tx.sv
-vvp sim/tb_uart
+make bitstream
 ```
 
-The current UART divisor is `27_000_000 / 115200 ≈ 234`. Validate echo first,
-then characterize the BL616 link before selecting a faster divisor.
+This runs `synth_gowin -family gw2a`, then nextpnr-himbaechel
+(`--device GW2AR-LV18QN88C8/I7 --vopt family=GW2A-18C`) at 27 MHz, then
+`gowin_pack`, producing `build/tpu.fs`. Check `build/nextpnr.log` for
+utilisation and the achieved Fmax. The design runs straight from the 27 MHz
+oscillator with no PLL; the UART is the bottleneck, not the array.
 
-## Hardware flow
+## Programming
 
-For Gowin EDA, create a Tang Nano 20K project, add the RTL and a board-specific
-PLL wrapper, constrain the 27 MHz input and LED/UART pins, and synthesize.
-For the open flow, use Yosys plus apicula/nextpnr-gowin and program with
-`openFPGALoader`. Keep the Linux JTAG udev rule disabled while testing UART if
-it interferes with the BL616 USB bridge.
+The BL616 on the board enumerates as an FTDI-compatible dual-channel device
+(0403:6010). Interface A is JTAG and interface B is the UART.
 
-Start at 81 MHz or below if timing at 100 MHz fails. The tile engine accepts staggered edge streams for 64 K terms and asserts
-`done` after the 74-cycle fill/compute/drain interval. The eventual controller
-should hide BRAM loads with ping-pong buffers.
+* **Windows + openFPGALoader**: use [Zadig](https://zadig.akeo.ie) to put
+  WinUSB on interface A only ("USB Serial Converter A" / "JTAG Debugger
+  (Interface 0)"). Leave interface B on the FTDI VCP driver so the UART
+  stays a COM port.
+* **Gowin Programmer** works with the stock driver instead. Load
+  `build/tpu.fs` with "SRAM Program" or "embFlash Erase, Program".
 
-The exact pin constraints are intentionally left as placeholders in
-`constraints/tang_nano_20k.cst`; obtain them from the board revision schematic.
+```sh
+make prog     # SRAM, lost at power-off
+make flash    # on-board flash, persists
+```
+
+## On-board test
+
+```sh
+python -m pip install pyserial
+python python/host.py COM4 info
+python python/host.py COM4 selftest --runs 4
+```
+
+`selftest` checks ECHO, loads random weights into both layers, then compares
+attention outputs from the FPGA with the Python oracle element by element.
+On Windows the UART is the higher-numbered of the two COM ports the board
+creates.
+
+## Protocol
+
+Frames are `A5 5A len_lo len_hi payload xor`. Request payloads are
+`op arg data`; responses are `op status data`.
+
+| op | arg | data | response |
+|---|---|---|---|
+| `01` ECHO | any | ≤ 2048 bytes | `01 00` + data |
+| `02` LOAD | layer·4 + m (q,k,v,o) | 64×64 int16 LE, row-major W[k][c] | `02 00` |
+| `03` ATTN | layer | 16×64 int16 LE X | `03 00` + 16×64 int16 LE O |
+| `04` INFO | — | — | `04 00 'TPU' 01` |
+| bad checksum | | | `EE 01` |
+
+LOAD writes weights while bytes arrive. If it is answered with `EE`, resend it.

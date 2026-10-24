@@ -1,0 +1,6 @@
+build/
+__pycache__/
+*.pyc
+sim/tpu_top_vectors.mem
+sim/attention_vector.json
+data/

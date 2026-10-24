@@ -1,15 +1,18 @@
-# Weight ROM format
+# Weights
 
-Export signed Q8.8 values as four-hex-digit two's-complement words, one value
-per line, in row-major order. Keep separate files for `layer{0,1}_{q,k,v,o}.mem`
-or concatenate them with a documented base address. `$readmemh` loads these
-files into BRAM inference.
+Attention weights are no longer baked into the bitstream. The host loads them
+over UART at run time (`TpuLink.load_weights`, or a `LOAD` frame per matrix),
+so retraining needs no resynthesis. They live in BSRAM until power-off.
 
-`softmax_exp.mem` stores Q0.16 `exp(-n/16)` values. `softmax_recip.mem`
-stores Q8.16 reciprocal values indexed by the normalized 16-bit denominator;
-zero maps to zero. The softmax datapath saturates outputs and assigns any
-truncation remainder to the row maximum so every row sums to 65536.
+Each matrix is 64×64 signed Q8.8, sent as little-endian int16 in row-major
+order W[k][c], the same orientation `attention_q8_8(x, wq, wk, wv, wo)` uses:
+`x @ W`. In `model_export.py`, `export_layer` still writes the `$readmemh`-style
+`layer{0,1}_{q,k,v,o}.mem` files (one four-hex-digit word per line, row-major),
+and `host.read_matrix` reads them back for loading.
 
-The four 64×64 matrices per layer consume 32 KiB per layer, or 64 KiB for two
-layers. Embedding,
-feed-forward, and output weights remain on the PC.
+On the FPGA, word `layer*4096 + m*1024 + cg*64 + k` holds
+`W_m[k][4cg .. 4cg+3]`, which is one B-edge column group of the systolic array.
+
+`softmax_exp.mem` is the Q0.16 `exp(-n/16)` table (five hex digits, since
+entry 0 is 65536) and is only a reference copy. The RTL uses the generated
+`rtl/exp_rom.sv`.

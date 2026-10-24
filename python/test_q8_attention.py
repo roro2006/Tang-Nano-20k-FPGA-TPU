@@ -1,6 +1,11 @@
+import random
 import unittest
+from pathlib import Path
 
-from host import decode_q8_matrix, encode_q8_matrix
+from generate_artifacts import exp_rom_sv
+from host import (OP_INFO, OP_LOAD, attention_request, decode_q8_matrix, encode_q8_matrix,
+                  load_request, response)
+from tiled_oracle import compare
 from model_export import embed_grid, full_inference, layer_norm_q8_8, positional_embedding
 from q8_attention import attention_q8_8, matmul_q8_8, pack_frame, unpack_frame
 
@@ -41,6 +46,33 @@ class Q8AttentionTests(unittest.TestCase):
         )
         self.assertEqual((len(embed_grid(grid)), len(positional_embedding())), (16, 16))
         self.assertEqual((len(output), len(output[0])), (16, 16))
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_load_request_layout(self):
+        matrix = [[(row * 64 + col) % 300 - 150 for col in range(64)] for row in range(64)]
+        frame = load_request(1, "v", matrix)
+        payload = unpack_frame(frame)
+        self.assertEqual(payload[:2], bytes([OP_LOAD, 6]))
+        self.assertEqual(len(payload), 2 + 8192)
+        self.assertEqual(decode_q8_matrix(payload[2:], 64, 64), matrix)
+
+    def test_attention_request_rejects_bad_shape(self):
+        with self.assertRaises(ValueError):
+            attention_request(0, [[0] * 64] * 15)
+
+    def test_response_frame(self):
+        self.assertEqual(unpack_frame(response(OP_INFO, 0, b"TPU\x01")), b"\x04\x00TPU\x01")
+
+    def test_tiled_matmul_matches_reference_with_overflow(self):
+        rng = random.Random(3)
+        a = [[rng.randint(-30000, 30000) for _ in range(64)] for _ in range(16)]
+        b = [[rng.randint(-30000, 30000) for _ in range(8)] for _ in range(64)]
+        self.assertTrue(compare(a, b))
+
+    def test_exp_rom_matches_generator(self):
+        rom = Path(__file__).resolve().parents[1] / "rtl" / "exp_rom.sv"
+        self.assertEqual(rom.read_text(), exp_rom_sv())
 
 
 if __name__ == "__main__":

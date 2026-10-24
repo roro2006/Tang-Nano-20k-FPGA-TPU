@@ -107,13 +107,17 @@ def full_inference(
     output_weight: Sequence[Sequence[int]],
     attention_transport=None,
 ) -> list[list[int]]:
-    """Run embedding, two attention round trips, transformer completion, and output."""
+    """Run embedding, two attention round trips, transformer completion, and output.
+
+    attention_transport(layer, x) runs one layer on the FPGA, e.g.
+    ``TpuLink(port).attention``; it defaults to the bit-exact software oracle.
+    """
     x = embed_grid(grid)
     for layer, weights in enumerate(attention_weights):
         if attention_transport is None:
             attended = attention_q8_8(x, weights["q"], weights["k"], weights["v"], weights["o"])
         else:
-            attended = attention_transport(encode_q8_matrix(x))
+            attended = attention_transport(layer, x)
         x = finish_layer(x, attended, *feed_forward[layer])
     return output_projection(x, output_weight)
 

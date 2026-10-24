@@ -2,7 +2,7 @@
 from __future__ import annotations
 import tkinter as tk
 from q8_attention import q8_8
-from host import encode_q8_matrix, run_once, decode_q8_matrix
+from host import TpuLink
 
 class DrawingApp:
     def __init__(self, port: str):
@@ -27,8 +27,8 @@ class DrawingApp:
                 for r in range(16)]
 
     def infer(self):
-        response = run_once(self.port, 115200, encode_q8_matrix(self.embed()), 5.0)
-        output = decode_q8_matrix(response, 16, 64)
+        with TpuLink(self.port) as tpu:
+            output = tpu.attention(0, self.embed())
         for r in range(16):
             for c in range(16):
                 self.canvas.itemconfigure(self.cells[r][c], fill="black" if output[r][c] > 0 else "white")

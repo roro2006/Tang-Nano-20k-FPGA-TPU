@@ -25,16 +25,32 @@ module tb_uart_echo;
         repeat (3) @(negedge clk);
         rst = 1'b0;
         send_byte(expected);
-        repeat (CPB * 2) @(negedge clk);
-        // Echo must begin with a low start bit and contain the original byte.
-        if (tx !== 1'b0)
-            $fatal(1, "echo did not start");
-        repeat (CPB + CPB / 2) @(negedge clk);
-        for (i = 0; i < 8; i = i + 1) begin
-            if (tx !== expected[i])
-                $fatal(1, "echo bit %0d mismatch", i);
-            repeat (CPB) @(negedge clk);
-        end
+    end
+
+    // Echo must begin with a low start bit and contain the original byte;
+    // sync on the falling edge and sample each bit in its middle.
+    initial begin : check
+        integer b;
+        fork
+            begin
+                @(negedge tx);
+                repeat (CPB / 2) @(negedge clk);
+                if (tx !== 1'b0)
+                    $fatal(1, "echo start bit too short");
+                for (b = 0; b < 8; b = b + 1) begin
+                    repeat (CPB) @(negedge clk);
+                    if (tx !== expected[b])
+                        $fatal(1, "echo bit %0d mismatch", b);
+                end
+                repeat (CPB) @(negedge clk);
+                if (tx !== 1'b1)
+                    $fatal(1, "echo stop bit missing");
+            end
+            begin
+                repeat (CPB * 40) @(negedge clk);
+                $fatal(1, "echo did not start");
+            end
+        join_any
         $display("uart_echo PASS");
         $finish;
     end
