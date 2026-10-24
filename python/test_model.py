@@ -6,9 +6,8 @@ from pathlib import Path
 
 import dataset
 from evaluate import binarize, classify, score
-from host import OP_LOAD, decode_q8_matrix, load_request, read_matrix
+from host import read_matrix
 from model_export import QuantModel, export_model, full_inference, layer_norm_q8_8, load_model
-from q8_attention import unpack_frame
 
 WEIGHTS = Path(__file__).resolve().parents[1] / "weights"
 HAS_TORCH = importlib.util.find_spec("torch") is not None
@@ -31,16 +30,14 @@ class ExportTests(unittest.TestCase):
             export_model(Path(tmp), model, {"note": "test"})
             self.assertEqual(load_model(Path(tmp)), model)
 
-    def test_exported_attention_files_are_load_frames(self):
+    def test_exported_matrices_read_back(self):
         model = random_model(random.Random(6))
         with tempfile.TemporaryDirectory() as tmp:
             export_model(Path(tmp), model)
             for layer in range(2):
-                for index, name in enumerate("qkvo"):
-                    matrix = read_matrix(Path(tmp) / f"layer{layer}_{name}.mem", 64, 64)
-                    payload = unpack_frame(load_request(layer, name, matrix))
-                    self.assertEqual(payload[:2], bytes([OP_LOAD, layer * 4 + index]))
-                    self.assertEqual(decode_q8_matrix(payload[2:], 64, 64), model.attention[layer][name])
+                for name in "qkvo":
+                    self.assertEqual(read_matrix(Path(tmp) / f"layer{layer}_{name}.mem", 64, 64),
+                                     model.attention[layer][name])
 
     def test_layer_norm_is_unit_scale(self):
         # Real values 1..4 normalize to about -1.34, -0.45, 0.45, 1.34.

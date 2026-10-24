@@ -1,11 +1,12 @@
 """Tkinter 16x16 drawing front end for the trained pattern denoiser.
 
-    python python/app.py COM4          # attention on the FPGA
+    python python/app.py COM4          # whole model on the FPGA
     python python/app.py --oracle      # software oracle, no board needed
 
 Draw on the left grid, press Infer, and the right grid shows the model's
-reconstruction plus the nearest pattern class. The attention weights are
-loaded into the FPGA once at start-up; the rest of the model runs here.
+reconstruction plus the nearest pattern class. The whole model runs on the
+FPGA (one INFER per press) with the weights baked into the bitstream; pass
+--load to send --weights first instead.
 """
 from __future__ import annotations
 import argparse
@@ -14,16 +15,16 @@ import tkinter as tk
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from evaluate import binarize, classify
+import tpu_model
+from evaluate import classify
 from host import TpuLink
-from model_export import QuantModel, full_inference, load_model
 
 CELL = 20
 WEIGHTS = Path(__file__).resolve().parents[1] / "weights"
 
 
 class DrawingApp:
-    def __init__(self, model: QuantModel, tpu: TpuLink | None):
+    def __init__(self, model: tpu_model.TpuModel, tpu: TpuLink | None):
         self.model, self.tpu = model, tpu
         self.grid = [[0] * 16 for _ in range(16)]
         self.root = tk.Tk()
@@ -56,13 +57,17 @@ class DrawingApp:
                 self.canvas.itemconfigure(cell, fill="white")
 
     def infer(self):
-        transport = self.tpu.attention if self.tpu else None
-        output = binarize(full_inference(self.grid, self.model.attention, self.model.feed_forward,
-                                         self.model.output, attention_transport=transport))
+        features = tpu_model.grid_features(self.grid)
+        if self.tpu:
+            _, cycles, logits = self.tpu.infer(features)
+            timing = f" ({cycles / 27e3:.2f} ms on chip)"
+        else:
+            logits, timing = tpu_model.forward(self.model, features), ""
+        output = tpu_model.pixels(logits)
         for r in range(16):
             for c in range(16):
                 self.canvas.itemconfigure(self.outputs[r][c], fill="black" if output[r][c] else "white")
-        self.status.configure(text=f"looks like: {classify(output)}")
+        self.status.configure(text=f"looks like: {classify(output)}{timing}")
 
     def run(self):
         self.root.mainloop()
@@ -71,18 +76,19 @@ class DrawingApp:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("port", nargs="?", help="UART port, e.g. COM4")
-    parser.add_argument("--oracle", action="store_true", help="run attention in software")
+    parser.add_argument("--oracle", action="store_true", help="run the model in software")
     parser.add_argument("--weights", type=Path, default=WEIGHTS)
+    parser.add_argument("--load", action="store_true", help="load --weights into the FPGA first")
     args = parser.parse_args()
     if not args.port and not args.oracle:
         parser.error("give a port or --oracle")
-    model = load_model(args.weights)
+    model = tpu_model.load(args.weights)
     if args.oracle:
         DrawingApp(model, None).run()
         return
     with TpuLink(args.port) as tpu:
-        for layer, weights in enumerate(model.attention):
-            tpu.load_weights(layer, weights)
+        if args.load:
+            tpu.load_model(model)
         DrawingApp(model, tpu).run()
 
 

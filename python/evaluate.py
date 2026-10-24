@@ -1,10 +1,11 @@
-"""Accuracy of the exported Q8.8 model through the bit-exact integer path.
+"""Accuracy of the on-chip model (tpu_model.py) through the bit-exact integer path.
 
-    python python/evaluate.py                    # software oracle (full_inference)
-    python python/evaluate.py --port COM4        # also run attention on the FPGA
+    python python/evaluate.py                    # software oracle (tpu_model.forward)
+    python python/evaluate.py --port COM4        # also run every sample on the FPGA
 
 The task is reconstruction: the model maps a noisy grid to the clean shifted
-pattern. A pixel is lit when its sigmoid output is at least 0.5 (128 in Q8.8).
+pattern. A pixel is lit when its logit is at least 0 (tpu_model.pixels); the
+PC-split model in model_export uses the equivalent sigmoid >= 128 (binarize).
 The class is the nearest clean template; "cross" and "plus" in dataset.py are
 the same pattern, so they are scored as one class.
 """
@@ -18,6 +19,7 @@ from typing import Callable, Sequence
 
 sys.path.insert(0, str(Path(__file__).parent))
 import dataset
+import tpu_model
 from model_export import QuantModel, full_inference, load_model
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,8 +73,17 @@ def held_out(path: Path = ROOT / "data" / "patterns.json") -> dict[str, list[dic
 
 
 def run(model: QuantModel, records: Sequence[dict], transport: Callable | None = None) -> list[Grid]:
+    """The PC-split model (model_export.full_inference); used by train.py."""
     return [full_inference(r["pixels"], model.attention, model.feed_forward, model.output,
                            attention_transport=transport) for r in records]
+
+
+def run_on_chip(model, records: Sequence[dict], infer: Callable | None = None) -> list[list[list[int]]]:
+    """Logits of the whole on-chip model, from the oracle or from TpuLink.infer."""
+    features = [tpu_model.grid_features(r["pixels"]) for r in records]
+    if infer is None:
+        return [tpu_model.forward(model, f) for f in features]
+    return [infer(f)[2] for f in features]
 
 
 def report(name: str, metrics: dict[str, float]) -> None:
@@ -84,32 +95,34 @@ def report(name: str, metrics: dict[str, float]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--weights", type=Path, default=ROOT / "weights")
-    parser.add_argument("--port", help="also run attention on the FPGA at this UART port")
+    parser.add_argument("--port", help="also run the model on the FPGA at this UART port")
+    parser.add_argument("--load", action="store_true",
+                        help="load --weights into the FPGA first (default: use the baked model)")
     parser.add_argument("--limit", type=int, default=0, help="samples per set (0 = all)")
     args = parser.parse_args()
-    model = load_model(args.weights)
+    model = tpu_model.load(args.weights)
     sets = {name: records[:args.limit or None] for name, records in held_out().items()}
     tpu = None
     if args.port:
         from host import TpuLink
         tpu = TpuLink(args.port)
-        for layer, weights in enumerate(model.attention):
-            tpu.load_weights(layer, weights)
+        if args.load:
+            tpu.load_model(model)
     ok = True
     try:
         for name, records in sets.items():
             start = time.perf_counter()
-            oracle = run(model, records)
+            oracle = run_on_chip(model, records)
             print(f"[{name}] oracle: {time.perf_counter() - start:.0f} s")
-            report(f"{name} (oracle)", score(records, [binarize(o) for o in oracle]))
+            report(f"{name} (oracle)", score(records, [tpu_model.pixels(o) for o in oracle]))
             if tpu is None:
                 continue
             start = time.perf_counter()
-            fpga = run(model, records, tpu.attention)
+            fpga = run_on_chip(model, records, tpu.infer)
             same = sum(f == o for f, o in zip(fpga, oracle))
-            print(f"[{name}] fpga: {time.perf_counter() - start:.0f} s, "
-                  f"{same}/{len(records)} outputs identical to the oracle")
-            report(f"{name} (fpga)", score(records, [binarize(f) for f in fpga]))
+            print(f"[{name}] fpga: {time.perf_counter() - start:.1f} s, "
+                  f"{same}/{len(records)} logit grids identical to the oracle")
+            report(f"{name} (fpga)", score(records, [tpu_model.pixels(f) for f in fpga]))
             ok = ok and same == len(records)
     finally:
         if tpu is not None:

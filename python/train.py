@@ -33,6 +33,7 @@ except ImportError as exc:
 
 sys.path.insert(0, str(Path(__file__).parent))
 import dataset
+import tpu_model
 from evaluate import binarize, held_out, report, score
 from model_export import QuantModel, export_model, positional_embedding
 from q8_attention import EXP_LUT
@@ -241,6 +242,9 @@ def main() -> None:
         "train": {"steps": args.steps, "qat_steps": args.qat_steps, "batch": args.batch, "seed": args.seed},
         "integer_path_metrics": metrics,
     })
+    # The fully on-chip model (int8 weights, integer layer norm); see tpu_model.py.
+    tpu_model.export(args.output, tpu_model.from_quant_model(quantized),
+                     {"source": "train.py via tpu_model.from_quant_model"})
     print(f"exported to {args.output}")
 
 

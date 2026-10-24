@@ -57,7 +57,8 @@ module tb_tpu_top;
         rst = 1'b0;
         repeat (20) @(posedge clk);
         for (i = 0; script[i] !== 12'hFFF; i = i + 1) begin
-            if (script[i][8] == 1'b0) begin
+            // 0xx: send, 1xx: expect xx, 2xx: expect any byte (cycle counts).
+            if (script[i][9:8] == 2'b00) begin
                 send_byte(script[i][7:0]);
             end else begin
                 wait_cycles = 0;
@@ -67,7 +68,7 @@ module tb_tpu_top;
                     if (wait_cycles > 200_000)
                         $fatal(1, "no response byte at script entry %0d", i);
                 end
-                if (rx_queue[rx_rd] !== script[i][7:0]) begin
+                if (script[i][9:8] == 2'b01 && rx_queue[rx_rd] !== script[i][7:0]) begin
                     if (errors < 20)
                         $display("mismatch at script %0d (response byte %0d): got %02x expected %02x",
                                  i, rx_rd, rx_queue[rx_rd], script[i][7:0]);

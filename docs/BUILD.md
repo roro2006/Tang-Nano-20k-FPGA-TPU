@@ -73,8 +73,10 @@ python python/host.py COM4 info
 python python/host.py COM4 selftest --runs 4
 ```
 
-`selftest` checks ECHO, loads random weights into both layers, then compares
-attention outputs from the FPGA with the Python oracle element by element.
+`selftest` checks ECHO, runs the baked model against `tpu_model.forward`,
+then loads a random model and compares INFER and ATTN outputs element by
+element. `python python/evaluate.py --port COM4` scores the baked model on
+the held-out sets on the FPGA.
 On Windows the UART is the higher-numbered of the two COM ports the board
 creates.
 
@@ -86,9 +88,26 @@ Frames are `A5 5A len_lo len_hi payload xor`. Request payloads are
 | op | arg | data | response |
 |---|---|---|---|
 | `01` ECHO | any | ≤ 2048 bytes | `01 00` + data |
-| `02` LOAD | layer·4 + m (q,k,v,o) | 64×64 int16 LE, row-major W[k][c] | `02 00` |
-| `03` ATTN | layer | 16×64 int16 LE X | `03 00` + 16×64 int16 LE O |
-| `04` INFO | — | — | `04 00 'TPU' 01` |
+| `02` LOAD | slot: layer·6 + (q,k,v,o,w1,w2); 12 embed; 13 output | lsh, then int8 W[k][c] row-major (64×64, 16×64, 64×16) | `02 00` |
+| `03` ATTN | layer | 16×64 int16 LE X | `03 00` + 16×64 int16 LE attention output |
+| `04` INFO | — | — | `04 00 'TPU' 02` + cycles (u32 LE) |
+| `05` INFER | 0 | 16×16 int16 LE features | `05 00` class, cycles (u32 LE), 16×16 int16 LE logits |
+| `06` LOADPOS | 0 | 16×64 int16 LE position table | `06 00` |
 | bad checksum | | | `EE 01` |
 
 LOAD writes weights while bytes arrive. If it is answered with `EE`, resend it.
+A weight's Q8.8 value is `int8 << lsh`; `tpu_model.quantize` picks the
+smallest shift per matrix. `cycles` is the core's compute time for the last
+ATTN or INFER.
+
+## Changing the baked model
+
+```sh
+python python/train.py        # writes weights/ in both formats
+make export                   # or: python python/tpu_model.py (convert existing weights/)
+make bitstream && make flash
+```
+
+`weights/tpu_weights.mem`, `tpu_lsh.mem` and `tpu_position.mem` become BSRAM
+initial values. To try a model without rebuilding, send it at run time with
+`TpuLink.load_model`; it lasts until reset.

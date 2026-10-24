@@ -3,8 +3,7 @@ import unittest
 from pathlib import Path
 
 from generate_artifacts import exp_rom_sv
-from host import (OP_INFO, OP_LOAD, attention_request, decode_q8_matrix, encode_q8_matrix,
-                  load_request, response)
+from host import OP_INFO, attention_request, decode_q8_matrix, encode_q8_matrix, response
 from tiled_oracle import compare
 from model_export import embed_grid, full_inference, layer_norm_q8_8, positional_embedding
 from q8_attention import attention_q8_8, matmul_q8_8, pack_frame, unpack_frame
@@ -49,14 +48,6 @@ class Q8AttentionTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_load_request_layout(self):
-        matrix = [[(row * 64 + col) % 300 - 150 for col in range(64)] for row in range(64)]
-        frame = load_request(1, "v", matrix)
-        payload = unpack_frame(frame)
-        self.assertEqual(payload[:2], bytes([OP_LOAD, 6]))
-        self.assertEqual(len(payload), 2 + 8192)
-        self.assertEqual(decode_q8_matrix(payload[2:], 64, 64), matrix)
-
     def test_attention_request_rejects_bad_shape(self):
         with self.assertRaises(ValueError):
             attention_request(0, [[0] * 64] * 15)

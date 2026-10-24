@@ -1,7 +1,8 @@
-"""PC-side transport for the Tang Nano attention packet protocol.
+"""PC-side transport for the Tang Nano TPU packet protocol (hardware v2).
 
 Request payload is ``op, arg, data``; the response payload is ``op, status,
-data``. See rtl/tpu_top.sv for the authoritative command table.
+data``. See rtl/tpu_top.sv for the authoritative command table and
+python/tpu_model.py for the model the FPGA runs.
 """
 
 from __future__ import annotations
@@ -13,13 +14,17 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+import tpu_model
 from q8_attention import attention_q8_8, pack_frame, unpack_frame
+from tpu_model import Int8Matrix, TpuModel
 
-OP_ECHO, OP_LOAD, OP_ATTN, OP_INFO, OP_ERROR = 0x01, 0x02, 0x03, 0x04, 0xEE
+OP_ECHO, OP_LOAD, OP_ATTN, OP_INFO, OP_INFER, OP_LOADPOS, OP_ERROR = (
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xEE)
 MATRIX_NAMES = ("q", "k", "v", "o")
-TOKENS, WIDTH = 16, 64
+TOKENS, WIDTH, FEATURES, OUTPUTS = 16, 64, 16, 16
 # Must match BAUD in rtl/tang_nano_20k_top.sv.
 DEFAULT_BAUD = 1_000_000
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_matrix(path: Path, rows: int, cols: int) -> list[list[int]]:
@@ -41,24 +46,53 @@ def decode_q8_matrix(payload: bytes, rows: int, cols: int) -> list[list[int]]:
     return [list(values[row * cols:(row + 1) * cols]) for row in range(rows)]
 
 
+def _check_shape(matrix: Sequence[Sequence[int]], rows: int, cols: int, what: str) -> None:
+    if len(matrix) != rows or any(len(row) != cols for row in matrix):
+        raise ValueError(f"{what} must be {rows}x{cols}")
+
+
 def request(op: int, arg: int = 0, data: bytes = b"") -> bytes:
     return pack_frame(bytes([op, arg]) + data)
 
 
-def load_request(layer: int, name: str, matrix: Sequence[Sequence[int]]) -> bytes:
-    if len(matrix) != WIDTH or any(len(row) != WIDTH for row in matrix):
-        raise ValueError("attention weights must be 64x64")
-    return request(OP_LOAD, layer * 4 + MATRIX_NAMES.index(name), encode_q8_matrix(matrix))
+def slot_shape(slot: int) -> tuple[int, int]:
+    if slot == tpu_model.SLOT_EMBED:
+        return FEATURES, WIDTH
+    if slot == tpu_model.SLOT_OUTPUT:
+        return WIDTH, OUTPUTS
+    return WIDTH, WIDTH
+
+
+def load_request(slot: int, matrix: Int8Matrix) -> bytes:
+    if not 0 <= slot < tpu_model.SLOTS:
+        raise ValueError(f"slot {slot} out of range")
+    _check_shape(matrix.values, *slot_shape(slot), f"slot {slot}")
+    data = bytes([matrix.lsh]) + bytes(v & 0xFF for row in matrix.values for v in row)
+    return request(OP_LOAD, slot, data)
 
 
 def attention_request(layer: int, x: Sequence[Sequence[int]]) -> bytes:
-    if len(x) != TOKENS or any(len(row) != WIDTH for row in x):
-        raise ValueError("attention input must be 16x64")
+    _check_shape(x, TOKENS, WIDTH, "attention input")
     return request(OP_ATTN, layer, encode_q8_matrix(x))
+
+
+def infer_request(features: Sequence[Sequence[int]]) -> bytes:
+    _check_shape(features, TOKENS, FEATURES, "features")
+    return request(OP_INFER, 0, encode_q8_matrix(features))
+
+
+def position_request(position: Sequence[Sequence[int]]) -> bytes:
+    _check_shape(position, TOKENS, WIDTH, "position table")
+    return request(OP_LOADPOS, 0, encode_q8_matrix(position))
 
 
 def response(op: int, status: int = 0, data: bytes = b"") -> bytes:
     return pack_frame(bytes([op, status]) + data)
+
+
+def infer_response(logits: Sequence[Sequence[int]], cycles: int) -> bytes:
+    data = bytes([tpu_model.predicted_class(logits)]) + struct.pack("<I", cycles)
+    return response(OP_INFER, 0, data + encode_q8_matrix(logits))
 
 
 class TpuLink:
@@ -107,19 +141,35 @@ class TpuLink:
             raise IOError(f"command {op:#04x} failed: op={got_op:#04x} status={status}")
         return data
 
-    def info(self) -> bytes:
-        return self._checked(request(OP_INFO), OP_INFO)
+    def info(self) -> tuple[bytes, int, int]:
+        """Return (magic, hardware version, cycles of the last ATTN/INFER)."""
+        data = self._checked(request(OP_INFO), OP_INFO)
+        return data[:3], data[3], struct.unpack("<I", data[4:8])[0]
 
     def echo(self, data: bytes) -> bytes:
         return self._checked(request(OP_ECHO, 0, data), OP_ECHO)
 
-    def load_weights(self, layer: int, weights: dict[str, Sequence[Sequence[int]]]) -> None:
-        for name in MATRIX_NAMES:
-            self._checked(load_request(layer, name, weights[name]), OP_LOAD)
+    def load_slot(self, slot: int, matrix: Int8Matrix) -> None:
+        self._checked(load_request(slot, matrix), OP_LOAD)
+
+    def load_position(self, position: Sequence[Sequence[int]]) -> None:
+        self._checked(position_request(position), OP_LOADPOS)
+
+    def load_model(self, model: TpuModel) -> None:
+        """Replace the baked model until the next reset."""
+        for slot in range(tpu_model.SLOTS):
+            self.load_slot(slot, model.slot(slot))
+        self.load_position(model.position)
 
     def attention(self, layer: int, x: Sequence[Sequence[int]]) -> list[list[int]]:
         data = self._checked(attention_request(layer, x), OP_ATTN)
         return decode_q8_matrix(data, TOKENS, WIDTH)
+
+    def infer(self, features: Sequence[Sequence[int]]) -> tuple[int, int, list[list[int]]]:
+        """Run the whole model on the FPGA: (class, compute cycles, 16x16 logits)."""
+        data = self._checked(infer_request(features), OP_INFER)
+        cycles = struct.unpack("<I", data[1:5])[0]
+        return data[0], cycles, decode_q8_matrix(data[5:], TOKENS, OUTPUTS)
 
 
 def run_once(port: str, baud: int, payload: bytes, timeout: float) -> bytes:
@@ -133,36 +183,67 @@ def random_matrix(rng: random.Random, rows: int, cols: int, span: int) -> list[l
     return [[rng.randint(-span, span) for _ in range(cols)] for _ in range(rows)]
 
 
-def random_layer(rng: random.Random, span: int = 64) -> dict[str, list[list[int]]]:
-    return {name: random_matrix(rng, WIDTH, WIDTH, span) for name in MATRIX_NAMES}
+def random_int8(rng: random.Random, rows: int, cols: int, span: int = 40,
+                lsh: int | None = None) -> Int8Matrix:
+    return Int8Matrix(tuple(tuple(rng.randint(-span, span) for _ in range(cols)) for _ in range(rows)),
+                      rng.randint(0, 2) if lsh is None else lsh)
+
+
+def random_model(rng: random.Random) -> TpuModel:
+    layers = tuple({name: random_int8(rng, WIDTH, WIDTH) for name in tpu_model.LAYER_MATRICES}
+                   for _ in range(tpu_model.LAYERS))
+    return TpuModel(random_int8(rng, FEATURES, WIDTH, 100), layers, random_int8(rng, WIDTH, OUTPUTS),
+                    tuple(tuple(row) for row in random_matrix(rng, TOKENS, WIDTH, 300)))
 
 
 def selftest(tpu: TpuLink, seed: int, runs: int) -> bool:
     rng = random.Random(seed)
-    info = tpu.info()
-    print(f"info: {info[:3].decode(errors='replace')} v{info[3] if len(info) > 3 else '?'}")
+    magic, version, _ = tpu.info()
+    print(f"info: {magic.decode(errors='replace')} v{version}")
     probe = bytes(rng.randrange(256) for _ in range(256))
     if tpu.echo(probe) != probe:
         print("echo: MISMATCH")
         return False
     print("echo: ok (256 bytes)")
-    layers = [random_layer(rng), random_layer(rng)]
-    start = time.perf_counter()
-    for layer, weights in enumerate(layers):
-        tpu.load_weights(layer, weights)
-    print(f"weights: loaded 2 layers in {time.perf_counter() - start:.1f} s")
     ok = True
+
+    baked_dir = ROOT / "weights"
+    if (baked_dir / tpu_model.MANIFEST).exists():
+        # Must run before any LOAD: checks the model built into the bitstream.
+        import dataset
+        baked = tpu_model.load(baked_dir)
+        same = 0
+        for record in dataset.hard_set(8, seed=seed):
+            features = tpu_model.grid_features(record["pixels"])
+            got_class, cycles, logits = tpu.infer(features)
+            expected = tpu_model.forward(baked, features)
+            same += logits == expected and got_class == tpu_model.predicted_class(expected)
+        print(f"baked model: {same}/8 inferences identical to tpu_model.forward "
+              f"({cycles} cycles = {cycles / 27e3:.2f} ms at 27 MHz)")
+        ok = ok and same == 8
+
+    model = random_model(rng)
+    start = time.perf_counter()
+    tpu.load_model(model)
+    print(f"random model: loaded in {time.perf_counter() - start:.1f} s")
     for run in range(runs):
-        layer = run % 2
-        x = random_matrix(rng, TOKENS, WIDTH, 512)
-        w = layers[layer]
-        expected = attention_q8_8(x, w["q"], w["k"], w["v"], w["o"])
+        features = random_matrix(rng, TOKENS, FEATURES, 512)
+        expected = tpu_model.forward(model, features)
         start = time.perf_counter()
-        got = tpu.attention(layer, x)
+        got_class, cycles, logits = tpu.infer(features)
         elapsed = time.perf_counter() - start
-        bad = sum(g != e for gr, er in zip(got, expected) for g, e in zip(gr, er))
-        print(f"attention run {run} layer {layer}: {'ok' if bad == 0 else f'{bad} mismatches'} "
-              f"({elapsed * 1000:.0f} ms round trip)")
+        bad = sum(g != e for gr, er in zip(logits, expected) for g, e in zip(gr, er))
+        bad += got_class != tpu_model.predicted_class(expected)
+        print(f"infer run {run}: {'ok' if bad == 0 else f'{bad} mismatches'} "
+              f"({cycles} cycles, {elapsed * 1000:.0f} ms round trip)")
+        ok = ok and bad == 0
+    for layer in range(tpu_model.LAYERS):
+        w = {name: model.layers[layer][name].q8_8() for name in MATRIX_NAMES}
+        x = random_matrix(rng, TOKENS, WIDTH, 512)
+        bad = sum(g != e for gr, er in zip(tpu.attention(layer, x),
+                                           attention_q8_8(x, w["q"], w["k"], w["v"], w["o"]))
+                  for g, e in zip(gr, er))
+        print(f"attention layer {layer}: {'ok' if bad == 0 else f'{bad} mismatches'}")
         ok = ok and bad == 0
     return ok
 
@@ -179,7 +260,8 @@ def main() -> None:
     args = parser.parse_args()
     with TpuLink(args.port, args.baud, args.timeout) as tpu:
         if args.command == "info":
-            print(tpu.info())
+            magic, version, cycles = tpu.info()
+            print(f"{magic.decode(errors='replace')} v{version}, last compute {cycles} cycles")
         elif args.command == "selftest":
             raise SystemExit(0 if selftest(tpu, args.seed, args.runs) else 1)
         else:
