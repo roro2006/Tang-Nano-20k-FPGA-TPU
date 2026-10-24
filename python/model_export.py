@@ -8,6 +8,7 @@ format and the inference-side residual/layer-norm/feed-forward contract.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -33,7 +34,8 @@ def layer_norm_q8_8(x: Sequence[Sequence[int]], eps: float = 1e-5) -> list[list[
     result = []
     for row in x:
         mean = sum(row) / len(row)
-        variance = sum((value - mean) ** 2 for value in row) / len(row)
+        # Variance of the real values (ints are scaled by 256, so by 65536).
+        variance = sum((value - mean) ** 2 for value in row) / len(row) / 65536.0
         scale = 1.0 / (variance + eps) ** 0.5
         result.append([q8_8(((value - mean) / 256.0) * scale) for value in row])
     return result
@@ -68,6 +70,55 @@ def export_layer(directory: Path, layer: int, weights: dict[str, Sequence[Sequen
         if name not in weights:
             raise ValueError(f"missing attention weight {name}")
         write_matrix(directory / f"layer{layer}_{name}.mem", weights[name])
+
+
+@dataclass(frozen=True)
+class QuantModel:
+    """Q8.8 weights for full_inference: FPGA attention plus PC-side layers."""
+
+    attention: list[dict[str, list[list[int]]]]
+    feed_forward: list[tuple[list[list[int]], list[list[int]]]]
+    output: list[list[int]]
+
+
+MANIFEST = "model.json"
+
+
+def export_model(directory: Path, model: QuantModel, meta: dict | None = None) -> None:
+    """Write every matrix as a .mem file plus a manifest of their shapes.
+
+    The attention files are the ones TpuLink.load_weights sends with LOAD;
+    w1/w2 and the output projection stay on the PC.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    shapes = {}
+    for layer, weights in enumerate(model.attention):
+        export_layer(directory, layer, weights)
+        shapes.update({f"layer{layer}_{name}": [64, 64] for name in ("q", "k", "v", "o")})
+    for layer, (w1, w2) in enumerate(model.feed_forward):
+        for name, matrix in (("w1", w1), ("w2", w2)):
+            write_matrix(directory / f"layer{layer}_{name}.mem", matrix)
+            shapes[f"layer{layer}_{name}"] = [len(matrix), len(matrix[0])]
+    write_matrix(directory / "output.mem", model.output)
+    shapes["output"] = [len(model.output), len(model.output[0])]
+    manifest = {"layers": len(model.attention), "shapes": shapes, **(meta or {})}
+    (directory / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def load_model(directory: Path) -> QuantModel:
+    manifest = json.loads((directory / MANIFEST).read_text())
+    shapes = manifest["shapes"]
+
+    def matrix(name: str) -> list[list[int]]:
+        return read_matrix(directory / f"{name}.mem", *shapes[name])
+
+    layers = range(manifest["layers"])
+    return QuantModel(
+        attention=[{name: matrix(f"layer{layer}_{name}") for name in ("q", "k", "v", "o")}
+                   for layer in layers],
+        feed_forward=[(matrix(f"layer{layer}_w1"), matrix(f"layer{layer}_w2")) for layer in layers],
+        output=matrix("output"),
+    )
 
 
 def save_vector(path: Path, x: Sequence[Sequence[int]], expected: Sequence[Sequence[int]]) -> None:
